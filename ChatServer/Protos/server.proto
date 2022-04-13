@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+option csharp_namespace = "ChatServer";
+
+package chat;
+
+
+service ChatServer {
+  // Bidirectional communication stream between client and server
+  rpc Communicate(stream ClientMessage) returns (stream ServerMessage);
+}
+
+
+// ------------------------------------------------------------------
+//                      ClientMessage
+// ------------------------------------------------------------------
+
+message ClientMessage {
+  oneof content {
+	ClientMessageLogin login = 1;
+	ClientMessageChat chat = 2;
+  }
+}
+
+// Must be called before any further requests.
+// Must wait for ServerMessageLoginSuccess/Failure before continuing.
+message ClientMessageLogin {
+  string chat_room_id = 1;
+  string user_name = 2;
+}
+
+message ClientMessageChat {
+  string text = 1;
+}
+
+
+// ------------------------------------------------------------------
+//                        ServerMessage
+// ------------------------------------------------------------------
+
+message ServerMessage {
+  oneof content {
+	ServerMessageLoginSuccess login_success = 1;
+	ServerMessageLoginFailure login_failure = 2;
+	ServerMessageUserJoined user_joined = 3;
+	ServerMessageUserLeft user_left = 4;
+	ServerMessageChat chat = 5;
+	ServerMessageTick tick = 6;
+	ServerMessageShutDown shut_down = 7;
+  }
+}
+
+message ServerMessageLoginSuccess {
+}
+
+message ServerMessageLoginFailure {
+  string reason = 1;
+}
+
+message ServerMessageUserJoined {
+  string user_name = 1;
+}
+
+message ServerMessageUserLeft {
+  string user_name = 1;
+}
+
+message ServerMessageChat {
+  string text = 1;
+  string user_name = 2;
+}
+
+message ServerMessageTick {
+  int32 tick = 1;
+}
+
+message ServerMessageShutDown {
+}
+
