@@ -1,19 +1,26 @@
+using ChatServer.Actors;
 using Grpc.Core;
+using Proto;
+using Log = Serilog.Log;
 
 namespace ChatServer.Services
 {
     /// <summary>
-    /// Accepts GRPC connections from clients and forwards them to their respective session.
+    /// Accepts GRPC connections from clients and forwards them to their respective chat room.
     /// </summary>
     public class ChatService : ChatServer.ChatServerBase
     {
-        private readonly ILogger _logger;
-
         public class ConnectionLostException : Exception { }
 
-        public ChatService(ILogger<ChatService> logger)
+        private ActorSystem _actorSystem;
+        private PID _supervisorPid;
+
+        public ChatService(ActorSystem actorSystem)
         {
-            _logger = logger;
+            _actorSystem = actorSystem;
+
+            var props = Props.FromProducer(() => new ChatRoomSupervisor());
+            _supervisorPid = _actorSystem.Root.SpawnNamed(props, "ChatRooms");
         }
 
         /// <summary>
@@ -24,61 +31,69 @@ namespace ChatServer.Services
         /// <param name="responseStream">You write to this stream to send messages to the client.</param>
         /// <param name="context">Metadata, including CancellationToken, see https://docs.microsoft.com/en-us/aspnet/core/grpc/services?view=aspnetcore-6.0</param>
         /// <returns></returns>
-        public override async Task Communicate(IAsyncStreamReader<ClientMessage> requestStream, IServerStreamWriter<ServerMessage> responseStream, ServerCallContext context)
+        public override async Task Communicate(
+            IAsyncStreamReader<ClientMessage> requestStream,
+            IServerStreamWriter<ServerMessage> responseStream,
+            ServerCallContext context)
         {
-            while (true)
-            {
-                // For now, simply echo all messages back to the client
-                
-                // You will want to implement the actual chat room logic here
+            var loginMessage = await WaitForLoginMessage(requestStream);
+            var chatRoomId = loginMessage.ChatRoomId;
+            var userName = loginMessage.UserName;
 
-                var clientMessage = await ReadMessageWithTimeoutAsync(requestStream, Timeout.InfiniteTimeSpan);
-                await SendChatAsync(responseStream, $"Received {clientMessage.ContentCase}");
-            }
-        }
+            var roomPid = await GetOrCreateRoom(chatRoomId);
+            Log.Debug("{UserName} joining chat room {ChatRoomId} at {RoomPid}", userName, chatRoomId, roomPid);
 
-        /// <summary>
-        /// Read a single message from the client.
-        /// </summary>
-        /// <exception cref="ConnectionLostException"></exception>
-        /// <exception cref="TimeoutException"></exception>
-        async Task<ClientMessage> ReadMessageWithTimeoutAsync(IAsyncStreamReader<ClientMessage> requestStream, TimeSpan timeout)
-        {
-            CancellationTokenSource cancellationTokenSource = new();
-            CancellationToken cancellationToken = cancellationTokenSource.Token;
-
-            cancellationTokenSource.CancelAfter(timeout);
+            var joinRequest = new ChatRoomActor.JoinRequest(userName, responseStream);
+            var clientPid = await _actorSystem.Root.RequestAsync<PID>(roomPid, joinRequest);
+            Log.Debug("{UserName} PID is {Pid}", userName, clientPid);
 
             try
             {
-                bool didMove = await requestStream.MoveNext(cancellationToken);
+                await foreach (var clientMessage in requestStream.ReadAllAsync())
+                {
+                    var chatMessage = new ChatRoomActor.ChatMessage(clientMessage.Chat.Text, clientPid);
+                    _actorSystem.Root.Send(roomPid, chatMessage);
+                }
+            }
+            catch (IOException)
+            {
+            }
+            finally
+            {
+                Log.Information("{UserName} has disconnected", userName);
+                await _actorSystem.Root.PoisonAsync(clientPid);
+            }
+        }
+
+        private async Task<PID> GetOrCreateRoom(string chatRoomId)
+        {
+            var request = new ChatRoomSupervisor.GetOrCreateRoomRequest(chatRoomId);
+            var response = await _actorSystem.Root.RequestAsync<PID>(_supervisorPid, request);
+            return response;
+        }
+
+        async Task<ClientMessageLogin> WaitForLoginMessage(IAsyncStreamReader<ClientMessage> requestStream)
+        {
+            try
+            {
+                bool didMove = await requestStream.MoveNext();
 
                 if (didMove == false)
                 {
                     throw new ConnectionLostException();
                 }
 
-                return requestStream.Current;
+                if (requestStream.Current.ContentCase != ClientMessage.ContentOneofCase.Login)
+                {
+                    throw new ApplicationException("Expected Login message");
+                }
+
+                return requestStream.Current.Login;
             }
             catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled)
             {
                 throw new TimeoutException();
             }
-        }
-
-        /// <summary>
-        /// Send a ServerMessageChat message to the client, using the provided text and username "SYSTEM".
-        /// </summary>
-        async Task SendChatAsync(IServerStreamWriter<ServerMessage> responseStream, string text)
-        {
-            await responseStream.WriteAsync(new ServerMessage
-            {
-                Chat = new ServerMessageChat
-                {
-                    Text = text,
-                    UserName = "SYSTEM"
-                }
-            });
         }
     }
 }
